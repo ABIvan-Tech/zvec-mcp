@@ -228,8 +228,7 @@ function chunkText(text, size = 1000, overlap = 200) {
 }
 
 function isSupportedFile(filePath) {
-    const ext = path.extname(filePath).toLowerCase();
-    if (!ALLOWED_EXTENSIONS.includes(ext)) return false;
+    if (!filePath || shouldIgnorePath(filePath)) return false;
 
     const normalizedPath = filePath.toLowerCase();
     const baseName = path.basename(filePath).toLowerCase();
@@ -244,7 +243,11 @@ function isSupportedFile(filePath) {
 
 function shouldIgnorePath(filePath) {
     const normalized = filePath.split(path.sep).join("/");
-    return IGNORED_DIRS.some((dir) => normalized.includes(`/${dir}/`) || normalized.endsWith(`/${dir}`));
+    const isIgnoredDir = IGNORED_DIRS.some((dir) => normalized.includes(`/${dir}/`) || normalized.endsWith(`/${dir}`));
+    if (isIgnoredDir) return true;
+
+    const ext = path.extname(filePath).toLowerCase();
+    return !ALLOWED_EXTENSIONS.includes(ext);
 }
 
 function escapeFilterValue(value) {
@@ -691,4 +694,4 @@ if (process.env.ZVEC_MCP_SKIP_MAIN !== "1") {
     });
 }
 
-export { ensureCollection, ensureKnowledgeReady, initializeKnowledgeBase, rankSearchResults, runInitializationOnce };
+export { ensureCollection, isSupportedFile, shouldIgnorePath, ensureKnowledgeReady, initializeKnowledgeBase, rankSearchResults, runInitializationOnce, startWatcher };
