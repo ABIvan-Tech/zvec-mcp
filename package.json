@@ -5,7 +5,7 @@
   "description": "This service is a standalone **MCP (Model Context Protocol)** server that embeds the **Zvec** vector database from Alibaba directly into the development environment",
   "main": "zvec-mcp-bridge.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "node --test"
   },
   "keywords": [],
   "author": "",

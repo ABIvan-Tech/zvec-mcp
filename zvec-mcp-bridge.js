@@ -25,10 +25,6 @@ if (env.backends && env.backends.onnx) {
     env.backends.onnx.logLevel = 'error';
 }
 
-process.on('uncaughtException', (err) => {
-    console.error("[Zvec Critical Error]", err);
-});
-
 // --- PATH CONFIGURATION ---
 const PROJECT_ROOT = process.env.PROJECT_ROOT || process.cwd();
 
@@ -45,7 +41,7 @@ env.cacheDir = MODELS_CACHE;
 env.allowRemoteModels = true;
 
 const ALLOWED_EXTENSIONS = [".js", ".jsx", ".ts", ".tsx", ".kt", ".erl", ".hrl", ".py", ".go", ".java", ".cs", ".rb", ".php", ".cpp", ".c", ".h", ".hpp", ".rs", ".swift", ".scala"];
-const IGNORED_DIRS = ["node_modules", ".git", "dist", "build", ".gradle", ".cache", ".next", ".turbo", ".vscode", ".idea"];
+const IGNORED_DIRS = ["node_modules", ".git", ".zvec", "dist", "build", ".gradle", ".cache", ".next", ".turbo", ".vscode", ".idea"];
 const EXCLUDED_FILE_NAMES = new Set([
     "package.json",
     "package-lock.json",
@@ -68,8 +64,6 @@ const EXCLUDED_FILE_NAMES = new Set([
     "jest.config.js",
     "init-options.json"
 ]);
-
-console.error(`[Zvec Bridge] Start. DB: ${DB_FILE}`);
 
 const schema = new ZVecCollectionSchema({
     name: "project_code",
@@ -96,29 +90,59 @@ let initializationPromise = null;
 let initializationStarted = false;
 let initializationState = "idle";
 let initializationMessage = "Knowledge base is not initialized yet.";
+let processHandlersRegistered = false;
+
+function registerProcessHandlers() {
+    if (processHandlersRegistered) return;
+    processHandlersRegistered = true;
+
+    process.on('uncaughtException', (err) => {
+        console.error("[Zvec Critical Error]", err);
+        process.exit(1);
+    });
+
+    process.on('unhandledRejection', (reason) => {
+        console.error("[Zvec Critical Rejection]", reason);
+        process.exit(1);
+    });
+}
+
+function beginInitialization(initializer) {
+    initializationStarted = true;
+    initializationState = "initializing";
+    initializationMessage = "Knowledge base is still initializing. Please retry shortly.";
+    initializationPromise = Promise.resolve()
+        .then(() => initializer())
+        .then((result) => {
+            initializationState = "ready";
+            initializationMessage = "Knowledge base ready.";
+            return result;
+        })
+        .catch((err) => {
+            initializationState = "failed";
+            initializationMessage = `Knowledge base initialization failed: ${err.message}`;
+            initializationStarted = false;
+            initializationPromise = null;
+            throw err;
+        });
+
+    return initializationPromise;
+}
 
 async function runInitializationOnce(initializer) {
     if (!initializationStarted) {
-        initializationStarted = true;
-        initializationState = "initializing";
-        initializationMessage = "Knowledge base is still initializing. Please retry shortly.";
-        initializationPromise = Promise.resolve()
-            .then(() => initializer())
-            .then((result) => {
-                initializationState = "ready";
-                initializationMessage = "Knowledge base ready.";
-                return result;
-            })
-            .catch((err) => {
-                initializationState = "failed";
-                initializationMessage = `Knowledge base initialization failed: ${err.message}`;
-                initializationStarted = false;
-                initializationPromise = null;
-                throw err;
-            });
+        return beginInitialization(initializer);
     }
 
     return initializationPromise;
+}
+
+async function rerunInitialization(initializer) {
+    if (initializationState === "initializing" && initializationPromise) {
+        return initializationPromise;
+    }
+
+    return beginInitialization(initializer);
 }
 
 function removeBrokenCollectionStorage() {
@@ -131,7 +155,7 @@ function removeBrokenCollectionStorage() {
             fs.rmSync(lockPath, { force: true });
             console.error("[Zvec Bridge] Removed outdated database lock:", lockPath);
         }
-        fs.rmSync(DB_FILE, { recursive: true, force: true });
+        fs.rmSync(DB_FILE, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
         console.error("[Zvec Bridge] Database storage removed for recreation:", DB_FILE);
     } else if (stats.isFile()) {
         fs.rmSync(DB_FILE, { force: true });
@@ -183,8 +207,6 @@ function ensureCollection() {
     return collection;
 }
 
-ensureCollection();
-
 let extractor = null;
 async function getEmbedding(text, timeoutMs = 15000) {
     const loadModel = async () => {
@@ -199,19 +221,24 @@ async function getEmbedding(text, timeoutMs = 15000) {
     };
 
     try {
-        if (timeoutMs > 0) {
+        if (timeoutMs <= 0) {
+            return await loadModel();
+        }
+
+        let timeoutId;
+        try {
             return await Promise.race([
                 loadModel(),
                 new Promise((_, reject) => {
-                    setTimeout(() => reject(new Error(`Embedding timed out after ${timeoutMs}ms`)), timeoutMs);
+                    timeoutId = setTimeout(() => reject(new Error(`Embedding timed out after ${timeoutMs}ms`)), timeoutMs);
                 })
             ]);
+        } finally {
+            if (timeoutId) clearTimeout(timeoutId);
         }
-
-        return await loadModel();
     } catch (err) {
         console.error("[Zvec Bridge] Error calculating vector:", err);
-        return new Array(384).fill(0.0);
+        throw err;
     }
 }
 
@@ -227,11 +254,24 @@ function chunkText(text, size = 1000, overlap = 200) {
     return chunks;
 }
 
+function isExistingDirectory(filePath) {
+    if (!filePath || !fs.existsSync(filePath)) return false;
+
+    try {
+        return fs.statSync(filePath).isDirectory();
+    } catch {
+        return false;
+    }
+}
+
 function isSupportedFile(filePath) {
-    if (!filePath || shouldIgnorePath(filePath)) return false;
+    if (!filePath || shouldIgnorePath(filePath) || isExistingDirectory(filePath)) return false;
 
     const normalizedPath = filePath.toLowerCase();
     const baseName = path.basename(filePath).toLowerCase();
+    const ext = path.extname(filePath).toLowerCase();
+
+    if (!ALLOWED_EXTENSIONS.includes(ext)) return false;
     if (EXCLUDED_FILE_NAMES.has(baseName)) return false;
     if (/\.d\.ts$/i.test(normalizedPath)) return false;
     if (/(^|\/)(package\.json|package-lock\.json|pnpm-lock\.yaml|yarn\.lock|tsconfig\.json|tsconfig\.app\.json|tsconfig\.node\.json|eslint\.config\.(js|cjs|mjs)|vite\.config\.(js|ts)|vitest\.config\.(js|ts)|babel\.config\.js|next\.config\.(js|mjs|ts)|tailwind\.config\.(js|cjs|mjs|ts)|postcss\.config\.(js|cjs|mjs|ts)|jest\.config\.(js|ts)|init-options\.json)$/i.test(normalizedPath)) {
@@ -242,11 +282,17 @@ function isSupportedFile(filePath) {
 }
 
 function shouldIgnorePath(filePath) {
+    if (!filePath) return true;
+
     const normalized = filePath.split(path.sep).join("/");
     const isIgnoredDir = IGNORED_DIRS.some((dir) => normalized.includes(`/${dir}/`) || normalized.endsWith(`/${dir}`));
     if (isIgnoredDir) return true;
 
+    if (isExistingDirectory(filePath)) return false;
+
     const ext = path.extname(filePath).toLowerCase();
+    if (!ext) return false;
+
     return !ALLOWED_EXTENSIONS.includes(ext);
 }
 
@@ -349,7 +395,8 @@ function rankSearchResults(query, results, excludePaths = [], includePaths = [])
 function removeFileFromIndex(filePath) {
     const resolvedPath = path.resolve(filePath);
     try {
-        collection.deleteSync(`file_path == "${escapeFilterValue(resolvedPath)}"`);
+        const col = ensureCollection();
+        col.deleteSync(`file_path == "${escapeFilterValue(resolvedPath)}"`);
     } catch (err) {
         console.error(`[Zvec Bridge] Error deleting from index ${resolvedPath}:`, err.message);
     }
@@ -358,8 +405,10 @@ function removeFileFromIndex(filePath) {
 async function indexFile(filePath) {
     const resolvedPath = path.resolve(filePath);
     try {
+        const col = ensureCollection();
+
         try {
-            collection.deleteSync(`file_path == "${escapeFilterValue(resolvedPath)}"`);
+            col.deleteSync(`file_path == "${escapeFilterValue(resolvedPath)}"`);
         } catch (e) {}
 
         if (!fs.existsSync(resolvedPath) || !isSupportedFile(resolvedPath)) return;
@@ -373,7 +422,14 @@ async function indexFile(filePath) {
 
         for (let i = 0; i < chunks.length; i++) {
             const chunk = chunks[i];
-            const vector = await getEmbedding(chunk);
+            let vector;
+
+            try {
+                vector = await getEmbedding(chunk);
+            } catch (err) {
+                console.error(`[Zvec Bridge] Skipping chunk ${i + 1}/${chunks.length} for ${resolvedPath}:`, err.message);
+                continue;
+            }
             
             const safeId = crypto
                 .createHash("md5")
@@ -390,8 +446,8 @@ async function indexFile(filePath) {
                 }
             };
 
-            if (typeof collection.insertSync === 'function') {
-                collection.insertSync(doc);
+            if (typeof col.insertSync === 'function') {
+                col.insertSync(doc);
             } else {
                 console.error(`[Zvec Bridge] Error: insertSync not found in the collection prototype.`);
             }
@@ -422,11 +478,11 @@ async function indexProject() {
 }
 
 async function initializeKnowledgeBase(forceRebuild = false) {
-    ensureCollection();
+    const col = ensureCollection();
 
     if (forceRebuild) {
         try {
-            collection.deleteByFilterSync("1=1");
+            col.deleteByFilterSync("1=1");
         } catch (err) {
             console.error("[Zvec Bridge] Could not clear the existing index:", err.message);
         }
@@ -445,35 +501,60 @@ async function initializeKnowledgeBase(forceRebuild = false) {
 async function ensureKnowledgeReady(options = {}) {
     const { waitForCompletion = false, timeoutMs = 0 } = options;
 
-    const hasExistingDatabase = fs.existsSync(DB_FILE);
+    const col = ensureCollection();
+    const docCount = col.stats?.docCount ?? 0;
+    const hasIndexedDocuments = docCount > 0;
+    const shouldStartInitialization = !initializationStarted;
 
-    if (!initializationStarted) {
-        if (hasExistingDatabase) {
-            initializationStarted = true;
-            initializationState = "ready";
-            initializationMessage = "Knowledge base already exists and is available.";
-            initializationPromise = Promise.resolve({ ready: true, status: "ready", message: initializationMessage });
-        } else {
-            try {
-                await runInitializationOnce(() => initializeKnowledgeBase(false));
-            } catch (err) {
+    if (shouldStartInitialization) {
+        const initPromise = runInitializationOnce(() => initializeKnowledgeBase(false));
+        if (!waitForCompletion) {
+            initPromise.catch((err) => {
                 console.error("[Zvec Bridge] Error initializing knowledge base:", err.message);
-                return { ready: false, status: "failed", message: initializationMessage };
-            }
+            });
         }
     }
 
     if (!waitForCompletion) {
-        return { ready: initializationState === "ready", status: initializationState, message: initializationMessage };
+        if (initializationState === "failed") {
+            return { ready: false, status: "failed", message: initializationMessage };
+        }
+
+        if (initializationState === "initializing") {
+            if (hasIndexedDocuments) {
+                return {
+                    ready: true,
+                    status: "ready",
+                    message: "Knowledge base already exists and is being refreshed in the background."
+                };
+            }
+
+            return { ready: false, status: "initializing", message: initializationMessage };
+        }
+
+        return { ready: true, status: "ready", message: initializationMessage };
     }
 
     if (initializationPromise && timeoutMs > 0) {
         const timeoutPromise = new Promise((resolve) => {
-            setTimeout(() => resolve({ ready: false, status: "initializing", message: initializationMessage }), timeoutMs);
+            setTimeout(() => {
+                if (hasIndexedDocuments) {
+                    resolve({
+                        ready: true,
+                        status: "ready",
+                        message: "Knowledge base already exists and is being refreshed in the background."
+                    });
+                    return;
+                }
+
+                resolve({ ready: false, status: "initializing", message: initializationMessage });
+            }, timeoutMs);
         });
 
         const result = await Promise.race([
-            initializationPromise.then(() => ({ ready: true, status: "ready", message: "Knowledge base ready." })),
+            initializationPromise
+                .then(() => ({ ready: true, status: "ready", message: "Knowledge base ready." }))
+                .catch(() => ({ ready: false, status: "failed", message: initializationMessage })),
             timeoutPromise
         ]);
 
@@ -481,7 +562,12 @@ async function ensureKnowledgeReady(options = {}) {
     }
 
     if (initializationPromise) {
-        await initializationPromise;
+        try {
+            await initializationPromise;
+        } catch (err) {
+            console.error("[Zvec Bridge] Error initializing knowledge base:", err.message);
+            return { ready: false, status: "failed", message: initializationMessage };
+        }
     }
 
     return { ready: initializationState === "ready", status: initializationState, message: initializationMessage };
@@ -638,7 +724,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     if (request.params?.name === "initialize_project_knowledge") {
         const forceRebuild = request.params?.arguments?.force_rebuild === true;
-        const result = await initializeKnowledgeBase(forceRebuild);
+        const result = await rerunInitialization(() => initializeKnowledgeBase(forceRebuild));
         return { content: [{ type: "text", text: `Knowledge base initialized at ${result.dbFile}` }] };
     }
 
@@ -681,6 +767,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 });
 
 async function main() {
+    registerProcessHandlers();
+    console.error(`[Zvec Bridge] Start. DB: ${DB_FILE}`);
+
     const transport = new StdioServerTransport();
     await server.connect(transport);
     await ensureKnowledgeReady({ waitForCompletion: false });
