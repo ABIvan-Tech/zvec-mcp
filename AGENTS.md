@@ -6,6 +6,11 @@ For repository and implementation questions, first consult the local project kno
 > The database indexes source files only. Files with extensions like `.md` (documentation), configuration files (`package.json`, `tsconfig.json`, `vite.config.ts`, `eslint.config.js`), and declaration files (`.d.ts`) are **ignored** by design. For these files or queries about general architecture/configs, skip vector search and use `grep_search` or `view_file` directly.
 > If the MCP tool throws locking/concurrency errors (e.g. `Can't lock collection`), it may mean there are stale bridge processes holding the file lock. Proactively list and terminate any stale `node zvec-mcp-bridge.js` processes.
 > If the index seems outdated or returns zero results on valid codebase queries, call `initialize_project_knowledge` with `force_rebuild: true` to regenerate the database.
+>
+> **Architecture**: The bridge runs in one of three modes:
+> - `--daemon --port N` — persistent HTTP/SSE daemon (shared by multiple clients)
+> - Default (auto) — auto-starts a daemon if none running, otherwise proxies to existing one
+> - **Legacy stdio** — runs standalone (fallback if daemon can't start)
 
 ## Available MCP Tools
 
