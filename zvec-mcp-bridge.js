@@ -30,7 +30,7 @@ import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import { pipeline, env } from '@huggingface/transformers';
-import { execSync } from "child_process";
+import { execSync, spawn } from "child_process";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -1240,9 +1240,6 @@ async function startDaemon(port) {
         }
     }
 
-    writeDaemonLock(port);
-    console.error(`[Zvec Bridge] Daemon PID ${process.pid} listening on port ${port}`);
-
     // Init knowledge base and watcher once
     await ensureKnowledgeReady({ waitForCompletion: false });
     startWatcher();
@@ -1288,7 +1285,6 @@ async function startDaemon(port) {
             return;
         }
 
-        // Health check endpoint
         if (req.method === "GET" && url.pathname === "/health") {
             res.writeHead(200, { "Content-Type": "application/json" });
             res.end(JSON.stringify({
@@ -1319,7 +1315,8 @@ async function startDaemon(port) {
     process.on("SIGINT", shutdown);
 
     httpServer.listen(port, "127.0.0.1", () => {
-        console.error(`[Zvec Bridge] Daemon ready on http://127.0.0.1:${port}`);
+        writeDaemonLock(port);
+        console.error(`[Zvec Bridge] Daemon ready on http://127.0.0.1:${port} (PID ${process.pid})`);
     });
 }
 
@@ -1366,13 +1363,49 @@ async function startProxy(port) {
 
 // ─── MAIN ───────────────────────────────────────────────────────────────────
 
+async function spawnDaemon(port) {
+    return new Promise((resolve, reject) => {
+        const child = spawn(process.execPath, [process.argv[1], "--daemon", "--port", String(port), ...process.argv.slice(2).filter(a => a !== "--daemon" && a !== "--port" && !/^\d+$/.test(a) && a !== String(port))], {
+            stdio: "ignore",
+            detached: true
+        });
+        child.unref();
+
+        // Wait for lock file to appear
+        let attempts = 0;
+        const interval = setInterval(() => {
+            attempts++;
+            const lock = readDaemonLock();
+            if (lock && lock.port === port) {
+                clearInterval(interval);
+                console.error(`[Zvec Bridge] Daemon started (PID ${lock.pid})`);
+                resolve(lock);
+            }
+            if (attempts > 20) {
+                clearInterval(interval);
+                reject(new Error("Daemon start timeout"));
+            }
+        }, 200);
+    });
+}
+
+function findFreePort() {
+    return new Promise((resolve) => {
+        const srv = http.createServer();
+        srv.listen(0, "127.0.0.1", () => {
+            const port = srv.address().port;
+            srv.close(() => resolve(port));
+        });
+        srv.on("error", () => resolve(3100)); // fallback
+    });
+}
+
 async function main() {
     registerProcessHandlers();
     console.error(`[Zvec Bridge] Start. DB: ${DB_FILE}`);
     console.error(`[Zvec Bridge] Extensions: ${ALLOWED_EXTENSIONS.join(", ")}`);
     console.error(`[Zvec Bridge] Model: ${EMBEDDING_MODEL}`);
 
-    // Parse CLI args for daemon mode
     const args = process.argv.slice(2);
     const daemonIdx = args.indexOf("--daemon");
     const isDaemonRequested = daemonIdx !== -1;
@@ -1388,26 +1421,34 @@ async function main() {
         return;
     }
 
-    // Stdio mode: check if daemon is already running
-    const daemonInfo = readDaemonLock();
+    // Auto-detect or start daemon
+    let daemonInfo = readDaemonLock();
     if (daemonInfo) {
         try {
             process.kill(daemonInfo.pid, 0);
-            console.error(`[Zvec Bridge] Daemon found on port ${daemonInfo.port} (PID ${daemonInfo.pid}). Starting proxy mode.`);
+            console.error(`[Zvec Bridge] Daemon found on port ${daemonInfo.port} (PID ${daemonInfo.pid}). Connecting via proxy.`);
             await startProxy(daemonInfo.port);
             return;
         } catch {
-            console.error(`[Zvec Bridge] Stale daemon lock (PID ${daemonInfo.pid}). Running in stdio mode.`);
+            console.error(`[Zvec Bridge] Stale daemon lock (PID ${daemonInfo.pid}). Starting new daemon.`);
             removeDaemonLock();
         }
     }
 
-    // Direct stdio mode (legacy)
-    const transport = new StdioServerTransport();
-    serverTransport = transport;
-    await server.connect(transport);
-    await ensureKnowledgeReady({ waitForCompletion: false });
-    startWatcher();
+    // No daemon — spawn one automatically on a free port
+    const port = await findFreePort();
+    console.error(`[Zvec Bridge] No daemon running. Starting one on port ${port}...`);
+    try {
+        daemonInfo = await spawnDaemon(port);
+        await startProxy(daemonInfo.port);
+    } catch (err) {
+        console.error(`[Zvec Bridge] ${err.message}. Falling back to legacy stdio mode.`);
+        const transport = new StdioServerTransport();
+        serverTransport = transport;
+        await server.connect(transport);
+        await ensureKnowledgeReady({ waitForCompletion: false });
+        startWatcher();
+    }
 }
 
 if (process.env.ZVEC_MCP_SKIP_MAIN !== "1") {
