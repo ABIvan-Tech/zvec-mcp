@@ -1,5 +1,7 @@
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import http from "http";
 import {
     CallToolRequestSchema,
     ListToolsRequestSchema,
@@ -42,6 +44,8 @@ if (env.backends && env.backends.onnx) {
 
 const PROJECT_ROOT = path.resolve(process.env.PROJECT_ROOT || process.cwd());
 const DB_FILE = path.join(PROJECT_ROOT, ".zvec", "knowledge.db");
+const DAEMON_LOCK_FILE = path.join(PROJECT_ROOT, ".zvec", "daemon.lock");
+const DAEMON_IDLE_TIMEOUT_MS = 30000; // 30s before shutdown when 0 clients
 
 const HOME_DIR = process.env.HOME || process.env.USERPROFILE;
 const MODELS_CACHE = path.join(HOME_DIR, ".cache", "huggingface", "transformers");
@@ -179,6 +183,9 @@ let initializationMessage = "Knowledge base is not initialized yet.";
 let processHandlersRegistered = false;
 let totalIndexedFiles = 0;
 let serverTransport = null;
+const sessionTransports = new Map(); // sessionId → SSEServerTransport (daemon mode)
+let idleTimeout = null;
+let isDaemonMode = false;
 
 function registerProcessHandlers() {
     if (processHandlersRegistered) return;
@@ -604,11 +611,18 @@ async function ensureKnowledgeReady(options = {}) {
     const shouldStartInitialization = !initializationStarted;
 
     if (shouldStartInitialization) {
-        const initPromise = runInitializationOnce(() => initializeKnowledgeBase(false));
-        if (!waitForCompletion) {
-            initPromise.catch((err) => {
-                console.error("[Zvec Bridge] Error initializing knowledge base:", err.message);
-            });
+        if (!hasIndexedDocuments) {
+            const initPromise = runInitializationOnce(() => initializeKnowledgeBase(false));
+            if (!waitForCompletion) {
+                initPromise.catch((err) => {
+                    console.error("[Zvec Bridge] Error initializing knowledge base:", err.message);
+                });
+            }
+        } else {
+            initializationState = "ready";
+            initializationMessage = "Knowledge base already exists. Skipping re-index on startup.";
+            initializationStarted = true;
+            initializationPromise = Promise.resolve({ ok: true, dbFile: DB_FILE });
         }
     }
 
@@ -679,15 +693,22 @@ function startWatcher() {
     });
 
     async function notifyResourceChanged(filePath) {
-        if (!serverTransport) return;
-        try {
-            const relativePath = path.relative(PROJECT_ROOT, filePath);
-            await serverTransport.send({
-                method: "notifications/resources/updated",
-                params: { uri: `zvec://file/${relativePath}` }
-            });
-        } catch (err) {
-            console.error("[Zvec Bridge] Failed to send resource notification:", err.message);
+        const relativePath = path.relative(PROJECT_ROOT, filePath);
+        const notification = {
+            method: "notifications/resources/updated",
+            params: { uri: `zvec://file/${relativePath}` }
+        };
+
+        if (isDaemonMode) {
+            for (const [sid, transport] of sessionTransports) {
+                try { await transport.send(notification); } catch (err) {
+                    console.error(`[Zvec Bridge] Failed to notify session ${sid}:`, err.message);
+                }
+            }
+        } else if (serverTransport) {
+            try { await serverTransport.send(notification); } catch (err) {
+                console.error("[Zvec Bridge] Failed to send resource notification:", err.message);
+            }
         }
     }
 
@@ -1164,12 +1185,224 @@ server.setRequestHandler(UnsubscribeRequestSchema, async (request) => {
     return {};
 });
 
+// ─── DAEMON MODE ────────────────────────────────────────────────────────────
+
+function readDaemonLock() {
+    try {
+        const data = fs.readFileSync(DAEMON_LOCK_FILE, "utf-8");
+        const parsed = JSON.parse(data);
+        if (parsed && parsed.pid && parsed.port) return parsed;
+    } catch {}
+    return null;
+}
+
+function writeDaemonLock(port) {
+    const dir = path.dirname(DAEMON_LOCK_FILE);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(DAEMON_LOCK_FILE, JSON.stringify({ pid: process.pid, port }));
+}
+
+function removeDaemonLock() {
+    try { fs.rmSync(DAEMON_LOCK_FILE, { force: true }); } catch {}
+}
+
+function scheduleShutdown() {
+    if (idleTimeout) clearTimeout(idleTimeout);
+    idleTimeout = setTimeout(() => {
+        const count = sessionTransports.size;
+        if (count > 0) {
+            console.error(`[Zvec Bridge] Cancel shutdown — ${count} client(s) still connected`);
+            return;
+        }
+        console.error(`[Zvec Bridge] Idle timeout — ${DAEMON_IDLE_TIMEOUT_MS}ms with 0 clients. Shutting down.`);
+        removeDaemonLock();
+        process.exit(0);
+    }, DAEMON_IDLE_TIMEOUT_MS);
+    idleTimeout.unref();
+}
+
+function cancelShutdown() {
+    if (idleTimeout) { clearTimeout(idleTimeout); idleTimeout = null; }
+}
+
+async function startDaemon(port) {
+    isDaemonMode = true;
+
+    const existing = readDaemonLock();
+    if (existing) {
+        try {
+            process.kill(existing.pid, 0);
+            console.error(`[Zvec Bridge] Daemon already running on port ${existing.port} (PID ${existing.pid}).`);
+            process.exit(1);
+        } catch {
+            console.error(`[Zvec Bridge] Removing stale lock file from PID ${existing.pid}.`);
+            removeDaemonLock();
+        }
+    }
+
+    writeDaemonLock(port);
+    console.error(`[Zvec Bridge] Daemon PID ${process.pid} listening on port ${port}`);
+
+    // Init knowledge base and watcher once
+    await ensureKnowledgeReady({ waitForCompletion: false });
+    startWatcher();
+
+    const httpServer = http.createServer(async (req, res) => {
+        const url = new URL(req.url, `http://localhost:${port}`);
+
+        if (req.method === "GET" && url.pathname === "/sse") {
+            const transport = new SSEServerTransport("/message", res);
+            const sessionId = transport.sessionId;
+            sessionTransports.set(sessionId, transport);
+            cancelShutdown();
+
+            transport.onclose = () => {
+                sessionTransports.delete(sessionId);
+                console.error(`[Zvec Bridge] Client ${sessionId} disconnected (${sessionTransports.size} remaining)`);
+                if (sessionTransports.size === 0) scheduleShutdown();
+            };
+
+            try {
+                await server.connect(transport);
+            } catch (err) {
+                console.error(`[Zvec Bridge] Error connecting SSE transport for ${sessionId}:`, err);
+                sessionTransports.delete(sessionId);
+            }
+            return;
+        }
+
+        if (req.method === "POST" && url.pathname === "/message") {
+            const sessionId = url.searchParams.get("sessionId");
+            if (!sessionId) {
+                res.writeHead(400);
+                res.end("Missing sessionId");
+                return;
+            }
+            const transport = sessionTransports.get(sessionId);
+            if (!transport) {
+                res.writeHead(404);
+                res.end("Session not found");
+                return;
+            }
+            await transport.handlePostMessage(req, res);
+            return;
+        }
+
+        // Health check endpoint
+        if (req.method === "GET" && url.pathname === "/health") {
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({
+                pid: process.pid,
+                port,
+                clients: sessionTransports.size,
+                status: initializationState,
+                db: fs.existsSync(DB_FILE),
+                uptime: process.uptime()
+            }));
+            return;
+        }
+
+        res.writeHead(404);
+        res.end("Not found");
+    });
+
+    const shutdown = () => {
+        console.error("[Zvec Bridge] Daemon shutting down...");
+        removeDaemonLock();
+        for (const [sid, transport] of sessionTransports) {
+            transport.close().catch(() => {});
+        }
+        httpServer.close(() => process.exit(0));
+    };
+
+    process.on("SIGTERM", shutdown);
+    process.on("SIGINT", shutdown);
+
+    httpServer.listen(port, "127.0.0.1", () => {
+        console.error(`[Zvec Bridge] Daemon ready on http://127.0.0.1:${port}`);
+    });
+}
+
+// ─── PROXY MODE ─────────────────────────────────────────────────────────────
+
+async function startProxy(port) {
+    const url = new URL(`http://127.0.0.1:${port}/sse`);
+
+    // Use SSEClientTransport from SDK
+    const { SSEClientTransport } = await import("@modelcontextprotocol/sdk/client/sse.js");
+    const transport = new SSEClientTransport(url);
+
+    transport.onmessage = (message) => {
+        const line = JSON.stringify(message);
+        process.stdout.write(line + "\n");
+    };
+
+    transport.onerror = (err) => {
+        console.error("[Zvec Proxy] SSE error:", err.message);
+        process.exit(1);
+    };
+
+    transport.onclose = () => {
+        process.exit(0);
+    };
+
+    await transport.start();
+
+    // Relay stdin JSON-RPC → daemon
+    const rl = (await import("readline")).createInterface({ input: process.stdin });
+    for await (const line of rl) {
+        if (!line.trim()) continue;
+        try {
+            const message = JSON.parse(line);
+            await transport.send(message);
+        } catch (err) {
+            console.error("[Zvec Proxy] Error forwarding message:", err.message);
+        }
+    }
+
+    await transport.close();
+    process.exit(0);
+}
+
+// ─── MAIN ───────────────────────────────────────────────────────────────────
+
 async function main() {
     registerProcessHandlers();
     console.error(`[Zvec Bridge] Start. DB: ${DB_FILE}`);
     console.error(`[Zvec Bridge] Extensions: ${ALLOWED_EXTENSIONS.join(", ")}`);
     console.error(`[Zvec Bridge] Model: ${EMBEDDING_MODEL}`);
 
+    // Parse CLI args for daemon mode
+    const args = process.argv.slice(2);
+    const daemonIdx = args.indexOf("--daemon");
+    const isDaemonRequested = daemonIdx !== -1;
+
+    if (isDaemonRequested) {
+        const portIdx = args.indexOf("--port");
+        const port = portIdx !== -1 ? parseInt(args[portIdx + 1], 10) : 3100;
+        if (isNaN(port) || port < 1 || port > 65535) {
+            console.error("[Zvec Bridge] Invalid port. Usage: --daemon --port <number>");
+            process.exit(1);
+        }
+        await startDaemon(port);
+        return;
+    }
+
+    // Stdio mode: check if daemon is already running
+    const daemonInfo = readDaemonLock();
+    if (daemonInfo) {
+        try {
+            process.kill(daemonInfo.pid, 0);
+            console.error(`[Zvec Bridge] Daemon found on port ${daemonInfo.port} (PID ${daemonInfo.pid}). Starting proxy mode.`);
+            await startProxy(daemonInfo.port);
+            return;
+        } catch {
+            console.error(`[Zvec Bridge] Stale daemon lock (PID ${daemonInfo.pid}). Running in stdio mode.`);
+            removeDaemonLock();
+        }
+    }
+
+    // Direct stdio mode (legacy)
     const transport = new StdioServerTransport();
     serverTransport = transport;
     await server.connect(transport);
