@@ -1,14 +1,26 @@
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import {
+    CallToolRequestSchema,
+    ListToolsRequestSchema,
+    ListResourcesRequestSchema,
+    ListResourceTemplatesRequestSchema,
+    ReadResourceRequestSchema,
+    ListPromptsRequestSchema,
+    GetPromptRequestSchema,
+    CompleteRequestSchema,
+    SetLevelRequestSchema,
+    SubscribeRequestSchema,
+    UnsubscribeRequestSchema
+} from "@modelcontextprotocol/sdk/types.js";
 import crypto from "crypto";
-import { 
-    ZVecCreateAndOpen, 
+import {
+    ZVecCreateAndOpen,
     ZVecOpen,
-    ZVecCollectionSchema, 
-    ZVecDataType, 
-    ZVecIndexType, 
-    ZVecMetricType 
+    ZVecCollectionSchema,
+    ZVecDataType,
+    ZVecIndexType,
+    ZVecMetricType
 } from "@zvec/zvec";
 
 import chokidar from "chokidar";
@@ -16,6 +28,7 @@ import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import { pipeline, env } from '@huggingface/transformers';
+import { execSync } from "child_process";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -25,45 +38,118 @@ if (env.backends && env.backends.onnx) {
     env.backends.onnx.logLevel = 'error';
 }
 
-// --- PATH CONFIGURATION ---
-const PROJECT_ROOT = process.env.PROJECT_ROOT || process.cwd();
+// ─── CONFIGURATION ──────────────────────────────────────────────────────────
 
-// 1. The database will now be created directly at the root of the scanned project!
-const DB_FILE = path.join(PROJECT_ROOT, ".zvec/knowledge.db");
+const PROJECT_ROOT = path.resolve(process.env.PROJECT_ROOT || process.cwd());
+const DB_FILE = path.join(PROJECT_ROOT, ".zvec", "knowledge.db");
 
-// 2. Hugging Face model cache will now live globally in your home directory (~/.cache/huggingface)
-// --- HUGGING FACE ISOLATION SETUP ---
 const HOME_DIR = process.env.HOME || process.env.USERPROFILE;
 const MODELS_CACHE = path.join(HOME_DIR, ".cache", "huggingface", "transformers");
-
 env.localModelPath = MODELS_CACHE;
 env.cacheDir = MODELS_CACHE;
 env.allowRemoteModels = true;
 
-const ALLOWED_EXTENSIONS = [".js", ".jsx", ".ts", ".tsx", ".kt", ".erl", ".hrl", ".py", ".go", ".java", ".cs", ".rb", ".php", ".cpp", ".c", ".h", ".hpp", ".rs", ".swift", ".scala"];
-const IGNORED_DIRS = ["node_modules", ".git", ".zvec", "dist", "build", ".gradle", ".cache", ".next", ".turbo", ".vscode", ".idea"];
-const EXCLUDED_FILE_NAMES = new Set([
-    "package.json",
-    "package-lock.json",
-    "pnpm-lock.yaml",
-    "yarn.lock",
-    "tsconfig.json",
-    "tsconfig.app.json",
-    "tsconfig.node.json",
-    "eslint.config.js",
-    "eslint.config.cjs",
-    "eslint.config.mjs",
-    "vite.config.js",
-    "vite.config.ts",
-    "vitest.config.js",
-    "vitest.config.ts",
-    "babel.config.js",
-    "next.config.js",
-    "tailwind.config.js",
-    "postcss.config.js",
-    "jest.config.js",
-    "init-options.json"
+const EMBEDDING_MODEL = process.env.ZVEC_EMBEDDING_MODEL || "Xenova/all-MiniLM-L6-v2";
+
+// --- Auto-detect project type and configure extensions ---
+
+const EXTENSION_PRESETS = {
+    js:    [".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"],
+    python: [".py", ".pyi", ".pyx"],
+    go:    [".go"],
+    rust:  [".rs"],
+    java:  [".java", ".kt", ".kts"],
+    ruby:  [".rb", ".rake", ".erb"],
+    php:   [".php"],
+    c:     [".c", ".h", ".cpp", ".hpp", ".cc", ".cxx"],
+    swift: [".swift"],
+    scala: [".scala", ".sc"],
+    erlang: [".erl", ".hrl"],
+    dotnet: [".cs", ".fs", ".vb"],
+};
+
+const DEFAULT_IGNORED_DIRS = [
+    "node_modules", ".git", ".zvec", "dist", "build", ".gradle",
+    ".cache", ".next", ".turbo", ".vscode", ".idea", "__pycache__",
+    ".venv", "venv", "target", "vendor", ".dart_tool", "Pods"
+];
+
+const DEFAULT_EXCLUDED_FILE_NAMES = new Set([
+    "package.json", "package-lock.json", "pnpm-lock.yaml", "yarn.lock",
+    "tsconfig.json", "tsconfig.app.json", "tsconfig.node.json",
+    "eslint.config.js", "eslint.config.cjs", "eslint.config.mjs",
+    "vite.config.js", "vite.config.ts", "vitest.config.js", "vitest.config.ts",
+    "babel.config.js", "next.config.js", "tailwind.config.js",
+    "postcss.config.js", "jest.config.js", "init-options.json",
+    "Cargo.toml", "Cargo.lock", "go.mod", "go.sum",
+    "pom.xml", "build.gradle", "build.gradle.kts",
+    "Gemfile", "Gemfile.lock", "composer.json", "composer.lock",
+    "requirements.txt", "pyproject.toml", "setup.py", "setup.cfg",
+    "Makefile", "CMakeLists.txt", "Dockerfile", "docker-compose.yml",
+    ".env", ".env.local", ".env.example"
 ]);
+
+function detectProjectExtensions(root) {
+    const detectors = [
+        { file: "package.json",    exts: EXTENSION_PRESETS.js },
+        { file: "pyproject.toml",  exts: EXTENSION_PRESETS.python },
+        { file: "setup.py",        exts: EXTENSION_PRESETS.python },
+        { file: "go.mod",          exts: EXTENSION_PRESETS.go },
+        { file: "Cargo.toml",      exts: EXTENSION_PRESETS.rust },
+        { file: "pom.xml",         exts: EXTENSION_PRESETS.java },
+        { file: "build.gradle",    exts: EXTENSION_PRESETS.java },
+        { file: "Gemfile",         exts: EXTENSION_PRESETS.ruby },
+        { file: "composer.json",   exts: EXTENSION_PRESETS.php },
+        { file: "Package.swift",   exts: EXTENSION_PRESETS.swift },
+        { file: "build.sbt",       exts: EXTENSION_PRESETS.scala },
+    ];
+
+    for (const { file, exts } of detectors) {
+        if (fs.existsSync(path.join(root, file))) return exts;
+    }
+
+    try {
+        const entries = fs.readdirSync(root, { withFileTypes: true });
+        const extCounts = {};
+        for (const e of entries) {
+            if (!e.isFile()) continue;
+            const ext = path.extname(e.name).toLowerCase();
+            if (ext) extCounts[ext] = (extCounts[ext] || 0) + 1;
+        }
+        const sorted = Object.entries(extCounts).sort((a, b) => b[1] - a[1]);
+        if (sorted.length > 0 && sorted[0][1] >= 2) return Object.keys(EXTENSION_PRESETS).flat();
+    } catch {}
+
+    return Object.keys(EXTENSION_PRESETS).flat();
+}
+
+function parseEnvList(value, fallback) {
+    if (!value || typeof value !== "string") return fallback;
+    try {
+        const parsed = JSON.parse(value);
+        return Array.isArray(parsed) ? parsed : fallback;
+    } catch {
+        return value.split(",").map(s => s.trim()).filter(Boolean);
+    }
+}
+
+const ALLOWED_EXTENSIONS = (() => {
+    const envVal = process.env.ZVEC_EXTENSIONS;
+    if (envVal) return parseEnvList(envVal, []);
+    return detectProjectExtensions(PROJECT_ROOT);
+})();
+
+const IGNORED_DIRS = (() => {
+    const envVal = process.env.ZVEC_IGNORE_DIRS;
+    if (envVal) return parseEnvList(envVal, DEFAULT_IGNORED_DIRS);
+    return DEFAULT_IGNORED_DIRS;
+})();
+
+const EXCLUDED_FILE_NAMES = (() => {
+    const envVal = process.env.ZVEC_EXCLUDE_FILES;
+    if (envVal) return new Set(parseEnvList(envVal, [...DEFAULT_EXCLUDED_FILE_NAMES]));
+    return DEFAULT_EXCLUDED_FILE_NAMES;
+})();
 
 const schema = new ZVecCollectionSchema({
     name: "project_code",
@@ -91,6 +177,8 @@ let initializationStarted = false;
 let initializationState = "idle";
 let initializationMessage = "Knowledge base is not initialized yet.";
 let processHandlersRegistered = false;
+let totalIndexedFiles = 0;
+let serverTransport = null;
 
 function registerProcessHandlers() {
     if (processHandlersRegistered) return;
@@ -211,7 +299,7 @@ let extractor = null;
 async function getEmbedding(text, timeoutMs = 15000) {
     const loadModel = async () => {
         if (!extractor) {
-            extractor = await pipeline('feature-extraction', 'Xenova/all-MiniLM-L6-v2', {
+            extractor = await pipeline('feature-extraction', EMBEDDING_MODEL, {
                 progress_callback: () => {}
             });
         }
@@ -402,6 +490,10 @@ function removeFileFromIndex(filePath) {
     }
 }
 
+function yieldToEventLoop() {
+    return new Promise((resolve) => setImmediate(resolve));
+}
+
 async function indexFile(filePath) {
     const resolvedPath = path.resolve(filePath);
     try {
@@ -411,9 +503,15 @@ async function indexFile(filePath) {
             col.deleteSync(`file_path == "${escapeFilterValue(resolvedPath)}"`);
         } catch (e) {}
 
-        if (!fs.existsSync(resolvedPath) || !isSupportedFile(resolvedPath)) return;
+        let exists = false;
+        try {
+            await fs.promises.access(resolvedPath);
+            exists = true;
+        } catch {}
 
-        const content = fs.readFileSync(resolvedPath, "utf-8");
+        if (!exists || !isSupportedFile(resolvedPath)) return;
+
+        const content = await fs.promises.readFile(resolvedPath, "utf-8");
         if (!content.trim()) return;
 
         const chunks = chunkText(content);
@@ -451,6 +549,8 @@ async function indexFile(filePath) {
             } else {
                 console.error(`[Zvec Bridge] Error: insertSync not found in the collection prototype.`);
             }
+
+            await yieldToEventLoop();
         }
     } catch (err) {
         console.error(`[Zvec Bridge] Error indexing ${resolvedPath}:`, err.message);
@@ -458,10 +558,11 @@ async function indexFile(filePath) {
 }
 
 async function indexProject() {
-    if (!fs.existsSync(PROJECT_ROOT)) return;
+    totalIndexedFiles = 0;
+    try { await fs.promises.access(PROJECT_ROOT); } catch { return; }
 
     const walk = async (dirPath) => {
-        const entries = fs.readdirSync(dirPath, { withFileTypes: true });
+        const entries = await fs.promises.readdir(dirPath, { withFileTypes: true });
         for (const entry of entries) {
             const entryPath = path.join(dirPath, entry.name);
             if (shouldIgnorePath(entryPath)) continue;
@@ -490,12 +591,8 @@ async function initializeKnowledgeBase(forceRebuild = false) {
 
     console.error("[Zvec Bridge] Starting project indexing...");
     await indexProject();
-    console.error("[Zvec Bridge] Project indexing completed.");
-    return {
-        ok: true,
-        dbFile: DB_FILE,
-        projectRoot: PROJECT_ROOT
-    };
+        console.error(`[Zvec Bridge] Project indexing completed. Files indexed: ${totalIndexedFiles}`);
+    return { ok: true, dbFile: DB_FILE, projectRoot: PROJECT_ROOT, filesIndexed: totalIndexedFiles };
 }
 
 async function ensureKnowledgeReady(options = {}) {
@@ -578,100 +675,148 @@ function startWatcher() {
         ignored: (p) => shouldIgnorePath(p),
         persistent: true,
         ignoreInitial: true,
-        awaitWriteFinish: {
-            stabilityThreshold: 300,
-            pollInterval: 100
-        }
+        awaitWriteFinish: { stabilityThreshold: 300, pollInterval: 100 }
     });
 
+    async function notifyResourceChanged(filePath) {
+        if (!serverTransport) return;
+        try {
+            const relativePath = path.relative(PROJECT_ROOT, filePath);
+            await serverTransport.send({
+                method: "notifications/resources/updated",
+                params: { uri: `zvec://file/${relativePath}` }
+            });
+        } catch (err) {
+            console.error("[Zvec Bridge] Failed to send resource notification:", err.message);
+        }
+    }
+
     watcher
-        .on("add", (fp) => { if (isSupportedFile(fp)) indexFile(fp); })
-        .on("change", (fp) => { if (isSupportedFile(fp)) indexFile(fp); })
-        .on("unlink", (fp) => { if (isSupportedFile(fp)) removeFileFromIndex(fp); });
+        .on("add", (fp) => { if (isSupportedFile(fp)) { indexFile(fp); notifyResourceChanged(fp); } })
+        .on("change", (fp) => { if (isSupportedFile(fp)) { indexFile(fp); notifyResourceChanged(fp); } })
+        .on("unlink", (fp) => { if (isSupportedFile(fp)) { removeFileFromIndex(fp); notifyResourceChanged(fp); } });
+}
+
+function getProjectInfo() {
+    const info = {
+        name: path.basename(PROJECT_ROOT),
+        root: PROJECT_ROOT,
+        dbFile: DB_FILE,
+        embeddingModel: EMBEDDING_MODEL,
+        allowedExtensions: ALLOWED_EXTENSIONS,
+        ignoredDirs: IGNORED_DIRS,
+        excludedFileCount: EXCLUDED_FILE_NAMES.size,
+    };
+    const detectors = [
+        { file: "package.json",     type: "Node.js/JavaScript" },
+        { file: "pyproject.toml",   type: "Python" },
+        { file: "setup.py",         type: "Python" },
+        { file: "go.mod",           type: "Go" },
+        { file: "Cargo.toml",       type: "Rust" },
+        { file: "pom.xml",          type: "Java (Maven)" },
+        { file: "build.gradle",     type: "Java (Gradle)" },
+        { file: "build.gradle.kts", type: "Kotlin" },
+        { file: "Gemfile",          type: "Ruby" },
+        { file: "composer.json",    type: "PHP" },
+        { file: "Package.swift",    type: "Swift" },
+        { file: "build.sbt",        type: "Scala" },
+    ];
+    for (const { file, type } of detectors) {
+        if (fs.existsSync(path.join(PROJECT_ROOT, file))) { info.projectType = type; break; }
+    }
+    if (!info.projectType) {
+        try {
+            const entries = fs.readdirSync(PROJECT_ROOT, { withFileTypes: true });
+            const extCounts = {};
+            for (const e of entries) {
+                if (!e.isFile()) continue;
+                const ext = path.extname(e.name).toLowerCase();
+                if (ext) extCounts[ext] = (extCounts[ext] || 0) + 1;
+            }
+            const sorted = Object.entries(extCounts).sort((a, b) => b[1] - a[1]);
+            if (sorted.length > 0) {
+                const topExt = sorted[0][0];
+                const knownMap = { ".js": "JavaScript/Node.js", ".ts": "TypeScript/Node.js", ".py": "Python", ".go": "Go", ".rs": "Rust", ".java": "Java", ".rb": "Ruby", ".php": "PHP", ".cs": ".NET", ".swift": "Swift", ".scala": "Scala" };
+                info.projectType = knownMap[topExt] || `Unknown (${topExt})`;
+            } else {
+                info.projectType = "Unknown";
+            }
+        } catch { info.projectType = "Unknown"; }
+    }
+    try { info.gitRemote = execSync('git remote get-url origin', { cwd: PROJECT_ROOT, encoding: 'utf-8', timeout: 3000 }).trim(); } catch {}
+    return info;
 }
 
 const server = new Server({
-    name: "zvec-antigravity-bridge",
-    version: "1.0.0"
+    name: "zvec-project-knowledge",
+    version: "2.0.0"
 }, {
-    capabilities: { tools: {} }
+    capabilities: {
+        tools: {},
+        resources: {},
+        prompts: {},
+        completions: {},
+        logging: {}
+    }
 });
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
     tools: [
         {
             name: "search_project_knowledge",
-            description: "Search the local Zvec knowledge base for relevant code snippets and implementation examples from the indexed project files. Use this when you need to find existing code patterns, functions, or project-specific logic by semantic query.",
+            description: "Semantic search through the indexed project codebase. Returns relevant code snippets with file paths and explanations. Use this as the first step before any broad repository search.",
             inputSchema: {
                 type: "object",
                 properties: {
-                    query: {
-                        type: "string",
-                        description: "Natural-language query to search the indexed project code"
-                    },
-                    exclude_paths: {
-                        type: "array",
-                        items: { type: "string" },
-                        description: "Optional list of path substrings to exclude from search results (e.g. ['src_old'])"
-                    },
-                    include_paths: {
-                        type: "array",
-                        items: { type: "string" },
-                        description: "Optional list of path substrings that must be present in search results (e.g. ['apps/client'])"
-                    }
+                    query: { type: "string", description: "Natural-language or keyword query to search the indexed code" },
+                    exclude_paths: { type: "array", items: { type: "string" }, description: "Path substrings to exclude from results" },
+                    include_paths: { type: "array", items: { type: "string" }, description: "Path substrings that must be present in results" }
                 },
                 required: ["query"]
             }
         },
         {
             name: "initialize_project_knowledge",
-            description: "Create the local Zvec database if it does not exist and index the current project files. Use this when the knowledge base is missing, was deleted, or you want to rebuild it explicitly.",
+            description: "Create or rebuild the Zvec knowledge base index. Call this when the index is missing, stale, or corrupted.",
             inputSchema: {
                 type: "object",
                 properties: {
-                    force_rebuild: {
-                        type: "boolean",
-                        description: "If true, clear the existing index entries before re-indexing the project"
-                    }
+                    force_rebuild: { type: "boolean", description: "If true, clear the existing index before re-indexing" }
                 }
             }
         },
         {
             name: "index_file",
-            description: "Force indexing or updating a specific file in the Zvec database immediately.",
+            description: "Force indexing or updating a specific file in the knowledge base immediately.",
             inputSchema: {
                 type: "object",
                 properties: {
-                    file_path: {
-                        type: "string",
-                        description: "Relative or absolute path of the file to index."
-                    }
+                    file_path: { type: "string", description: "Relative or absolute path of the file to index" }
                 },
                 required: ["file_path"]
             }
         },
         {
             name: "get_knowledge_status",
-            description: "Get the current health and statistics of the local Zvec knowledge base (document count, indexes, disk paths, etc.).",
-            inputSchema: {
-                type: "object",
-                properties: {}
-            }
+            description: "Get health, statistics, and configuration of the knowledge base (document count, init state, project root, detected extensions).",
+            inputSchema: { type: "object", properties: {} }
         }
     ]
 }));
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
-    if (request.params?.name === "search_project_knowledge") {
-        const query = request.params?.arguments?.query;
-        const excludePaths = request.params?.arguments?.exclude_paths;
-        const includePaths = request.params?.arguments?.include_paths;
+    const { name, arguments: args } = request.params || {};
+
+    if (name === "search_project_knowledge") {
+        const query = args?.query;
+        const excludePaths = args?.exclude_paths;
+        const includePaths = args?.include_paths;
 
         if (typeof query !== "string" || !query.trim()) {
             return { content: [{ type: "text", text: "Empty search query." }] };
         }
 
-        console.error(`[Zvec Bridge] AI is searching: "${query}" (ex: ${JSON.stringify(excludePaths)}, in: ${JSON.stringify(includePaths)})`);
+        console.error(`[Zvec Bridge] Searching: "${query}" (exclude: ${JSON.stringify(excludePaths)}, include: ${JSON.stringify(includePaths)})`);
 
         const readiness = await ensureKnowledgeReady({ waitForCompletion: false });
         if (!readiness.ready) {
@@ -679,98 +824,354 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
 
         let queryVector;
-        try {
-            queryVector = await getEmbedding(query, 15000);
-        } catch (err) {
+        try { queryVector = await getEmbedding(query, 15000); } catch (err) {
             console.error("[Zvec Bridge] Error preparing query vector:", err);
             return { content: [{ type: "text", text: "Knowledge base is still warming up. The embedding model is loading; please retry shortly." }] };
         }
 
         const response = await ensureCollection().query({
-            fieldName: "code_embedding",
-            vector: queryVector,
-            topk: 15 // Higher topk allows better candidates for javascript reranking/explanation
+            fieldName: "code_embedding", vector: queryVector, topk: 15
         });
 
         let results = [];
-        if (Array.isArray(response)) {
-            results = response;
-        } else if (response && Array.isArray(response.rows)) {
-            results = response.rows;
-        } else if (response && Array.isArray(response.results)) {
-            results = response.results;
-        } else if (response && Array.isArray(response.documents)) {
-            results = response.documents;
-        } else {
-            console.error("[Zvec Bridge] Unknown structure of query response:", JSON.stringify(response));
-        }
+        if (Array.isArray(response)) results = response;
+        else if (response?.rows) results = response.rows;
+        else if (response?.results) results = response.results;
+        else if (response?.documents) results = response.documents;
+        else console.error("[Zvec Bridge] Unknown query response structure:", JSON.stringify(response));
 
         if (results.length === 0) {
             return { content: [{ type: "text", text: "Nothing found in the Zvec codebase." }] };
         }
 
-        const rankedResults = rankSearchResults(query, results, excludePaths, includePaths);
+        const ranked = rankSearchResults(query, results, excludePaths, includePaths);
+        const formatted = ranked.map(res => `
+---
+File: ${res.fields?.file_path || 'Unknown'}
+Why selected: ${res.explanation || 'Contains relevant code.'}
+Code:
+${res.fields?.text_content || ''}
+`).join("\n");
 
-        const formattedResults = rankedResults.map(res => `
-        ---
-        File: ${res.fields?.file_path || 'Unknown'}
-        Why selected: ${res.explanation || 'Contains relevant code.'}
-        Code:
-        ${res.fields?.text_content || ''}
-        `).join("\n");
-
-        return { content: [{ type: "text", text: formattedResults || "Nothing found in the Zvec codebase." }] };
+        return { content: [{ type: "text", text: formatted || "Nothing found in the Zvec codebase." }] };
     }
 
-    if (request.params?.name === "initialize_project_knowledge") {
-        const forceRebuild = request.params?.arguments?.force_rebuild === true;
+    if (name === "initialize_project_knowledge") {
+        const forceRebuild = args?.force_rebuild === true;
         const result = await rerunInitialization(() => initializeKnowledgeBase(forceRebuild));
-        return { content: [{ type: "text", text: `Knowledge base initialized at ${result.dbFile}` }] };
+        return { content: [{ type: "text", text: `Knowledge base initialized at ${result.dbFile}. Files indexed: ${result.filesIndexed}` }] };
     }
 
-    if (request.params?.name === "index_file") {
-        const filePathArg = request.params?.arguments?.file_path;
+    if (name === "index_file") {
+        const filePathArg = args?.file_path;
         if (typeof filePathArg !== "string" || !filePathArg.trim()) {
             return { content: [{ type: "text", text: "Empty file_path." }] };
         }
         const fullPath = path.resolve(PROJECT_ROOT, filePathArg);
-        if (!fs.existsSync(fullPath)) {
-            return { content: [{ type: "text", text: `File not found: ${fullPath}` }] };
-        }
-        if (!isSupportedFile(fullPath)) {
-            return { content: [{ type: "text", text: `File format/name not supported: ${fullPath}` }] };
-        }
+        if (!fs.existsSync(fullPath)) return { content: [{ type: "text", text: `File not found: ${fullPath}` }] };
+        if (!isSupportedFile(fullPath)) return { content: [{ type: "text", text: `File format/name not supported: ${fullPath}` }] };
         await indexFile(fullPath);
-        return { content: [{ type: "text", text: `Successfully indexed file: ${filePathArg}` }] };
+        return { content: [{ type: "text", text: `Successfully indexed: ${filePathArg}` }] };
     }
 
-    if (request.params?.name === "get_knowledge_status") {
+    if (name === "get_knowledge_status") {
         const col = ensureCollection();
         const stats = col.stats;
+        const info = getProjectInfo();
         const statusInfo = {
+            ...info,
+            docCount: stats?.docCount ?? 0,
+            indexCompleteness: stats?.indexCompleteness ?? {},
+            initializationState,
+            totalIndexedFiles
+        };
+        return { content: [{ type: "text", text: JSON.stringify(statusInfo, null, 2) }] };
+    }
+
+    throw new Error(`Tool not found: ${name}`);
+});
+
+// ── ListResources ───────────────────────────────────────────────────────────
+
+server.setRequestHandler(ListResourcesRequestSchema, async () => ({
+    resources: [
+        {
+            uri: "zvec://project/info",
+            name: "Project Information",
+            description: "Metadata about the indexed project: root path, detected type, extensions, git remote.",
+            mimeType: "application/json"
+        },
+        {
+            uri: "zvec://knowledge/status",
+            name: "Knowledge Base Status",
+            description: "Current health and statistics of the Zvec knowledge base.",
+            mimeType: "application/json"
+        }
+    ]
+}));
+
+// ── ListResourceTemplates ───────────────────────────────────────────────────
+
+server.setRequestHandler(ListResourceTemplatesRequestSchema, async () => ({
+    resourceTemplates: [
+        {
+            uriTemplate: "zvec://file/{path}",
+            name: "Indexed File Content",
+            description: "Read the original content of a file that has been indexed in the knowledge base.",
+            mimeType: "text/plain"
+        }
+    ]
+}));
+
+// ── ReadResource ────────────────────────────────────────────────────────────
+
+server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
+    const { uri } = request.params;
+
+    if (uri === "zvec://project/info") {
+        return {
+            contents: [{ uri, mimeType: "application/json", text: JSON.stringify(getProjectInfo(), null, 2) }]
+        };
+    }
+
+    if (uri === "zvec://knowledge/status") {
+        const col = ensureCollection();
+        const stats = col.stats;
+        const status = {
             dbPath: DB_FILE,
             exists: fs.existsSync(DB_FILE),
             docCount: stats?.docCount ?? 0,
-            indexCompleteness: stats?.indexCompleteness ?? {},
-            initializationState: initializationState,
-            projectRoot: PROJECT_ROOT
+            initializationState,
+            totalIndexedFiles
         };
         return {
-            content: [{
-                type: "text",
-                text: JSON.stringify(statusInfo, null, 2)
+            contents: [{ uri, mimeType: "application/json", text: JSON.stringify(status, null, 2) }]
+        };
+    }
+
+    if (uri.startsWith("zvec://file/")) {
+        const filePath = decodeURIComponent(uri.slice("zvec://file/".length));
+        const fullPath = path.resolve(PROJECT_ROOT, filePath);
+        if (!fs.existsSync(fullPath)) throw new Error(`File not found: ${filePath}`);
+        const content = await fs.promises.readFile(fullPath, "utf-8");
+        return {
+            contents: [{ uri, mimeType: "text/plain", text: content }]
+        };
+    }
+
+    throw new Error(`Unknown resource URI: ${uri}`);
+});
+
+// ── ListPrompts ─────────────────────────────────────────────────────────────
+
+server.setRequestHandler(ListPromptsRequestSchema, async () => ({
+    prompts: [
+        {
+            name: "explore_codebase",
+            description: "Get an overview of the project structure and key files.",
+            arguments: [
+                { name: "topic", description: "Specific topic or area to focus on (optional)", required: false }
+            ]
+        },
+        {
+            name: "find_similar_code",
+            description: "Find code similar to a given snippet or pattern.",
+            arguments: [
+                { name: "code_snippet", description: "Code pattern or description to find similar implementations for", required: true }
+            ]
+        },
+        {
+            name: "explain_file",
+            description: "Get detailed information about a specific file and its role in the project.",
+            arguments: [
+                { name: "file_path", description: "Path to the file to explain", required: true }
+            ]
+        },
+        {
+            name: "debug_help",
+            description: "Search for error handling patterns, logging, and debugging approaches in the project.",
+            arguments: [
+                { name: "error_description", description: "Description of the error or issue", required: false }
+            ]
+        }
+    ]
+}));
+
+// ── GetPrompt ───────────────────────────────────────────────────────────────
+
+server.setRequestHandler(GetPromptRequestSchema, async (request) => {
+    const { name, arguments: args } = request.params;
+
+    if (name === "explore_codebase") {
+        const topic = args?.topic || "general structure";
+        const readiness = await ensureKnowledgeReady({ waitForCompletion: false });
+        if (!readiness.ready) {
+            return { messages: [{ role: "user", content: { type: "text", text: `Knowledge base is initializing. Please retry shortly to explore: ${topic}` } }] };
+        }
+        let queryVector;
+        try { queryVector = await getEmbedding(`project structure ${topic}`, 15000); } catch {
+            return { messages: [{ role: "user", content: { type: "text", text: "Embedding model still loading. Please retry shortly." } }] };
+        }
+        const response = await ensureCollection().query({ fieldName: "code_embedding", vector: queryVector, topk: 5 });
+        let results = Array.isArray(response) ? response : response?.rows || response?.results || response?.documents || [];
+        const fileList = results.map(r => r.fields?.file_path).filter(Boolean).join("\n");
+        return {
+            messages: [{
+                role: "user",
+                content: { type: "text", text: `Explore the project structure focusing on: ${topic}\n\nKey files found:\n${fileList || "No files found yet."}\n\nPlease provide an overview of the project structure and how these files relate to each other.` }
             }]
         };
     }
 
-    throw new Error("Tool not found");
+    if (name === "find_similar_code") {
+        const snippet = args?.code_snippet;
+        if (!snippet) return { messages: [{ role: "user", content: { type: "text", text: "Please provide a code snippet or description to search for." } }] };
+        const readiness = await ensureKnowledgeReady({ waitForCompletion: false });
+        if (!readiness.ready) {
+            return { messages: [{ role: "user", content: { type: "text", text: "Knowledge base is initializing. Please retry shortly." } }] };
+        }
+        let queryVector;
+        try { queryVector = await getEmbedding(snippet, 15000); } catch {
+            return { messages: [{ role: "user", content: { type: "text", text: "Embedding model still loading. Please retry shortly." } }] };
+        }
+        const response = await ensureCollection().query({ fieldName: "code_embedding", vector: queryVector, topk: 10 });
+        let results = Array.isArray(response) ? response : response?.rows || response?.results || response?.documents || [];
+        const ranked = rankSearchResults(snippet, results);
+        const found = ranked.slice(0, 5).map(r => `File: ${r.fields?.file_path}\nCode:\n${r.fields?.text_content}`).join("\n---\n");
+        return {
+            messages: [{
+                role: "user",
+                content: { type: "text", text: `Find code similar to:\n${snippet}\n\nResults:\n${found || "No similar code found."}\n\nAnalyze these results and explain how they relate to the provided snippet.` }
+            }]
+        };
+    }
+
+    if (name === "explain_file") {
+        const filePath = args?.file_path;
+        if (!filePath) return { messages: [{ role: "user", content: { type: "text", text: "Please provide a file path." } }] };
+        const fullPath = path.resolve(PROJECT_ROOT, filePath);
+        let content = "";
+        try { content = await fs.promises.readFile(fullPath, "utf-8"); } catch {
+            return { messages: [{ role: "user", content: { type: "text", text: `Could not read file: ${filePath}` } }] };
+        }
+        return {
+            messages: [{
+                role: "user",
+                content: { type: "text", text: `Explain the following file and its role in the project:\n\nFile: ${filePath}\n\n\`\`\`\n${content.slice(0, 8000)}\n\`\`\`` }
+            }]
+        };
+    }
+
+    if (name === "debug_help") {
+        const errorDesc = args?.error_description || "general debugging";
+        const readiness = await ensureKnowledgeReady({ waitForCompletion: false });
+        if (!readiness.ready) {
+            return { messages: [{ role: "user", content: { type: "text", text: "Knowledge base is initializing. Please retry shortly." } }] };
+        }
+        let queryVector;
+        try { queryVector = await getEmbedding(`error handling logging ${errorDesc}`, 15000); } catch {
+            return { messages: [{ role: "user", content: { type: "text", text: "Embedding model still loading. Please retry shortly." } }] };
+        }
+        const response = await ensureCollection().query({ fieldName: "code_embedding", vector: queryVector, topk: 5 });
+        let results = Array.isArray(response) ? response : response?.rows || response?.results || response?.documents || [];
+        const found = results.map(r => `File: ${r.fields?.file_path}\n${r.fields?.text_content}`).join("\n---\n");
+        return {
+            messages: [{
+                role: "user",
+                content: { type: "text", text: `Help debug: ${errorDesc}\n\nRelated error handling code:\n${found || "No relevant patterns found."}\n\nAnalyze these patterns and suggest debugging approaches.` }
+            }]
+        };
+    }
+
+    throw new Error(`Prompt not found: ${name}`);
+});
+
+// ── Complete (autocomplete) ─────────────────────────────────────────────────
+
+server.setRequestHandler(CompleteRequestSchema, async (request) => {
+    const { ref, argument } = request.params;
+    let values = [];
+
+    if (ref.type === "ref/prompt") {
+        if (ref.name === "explore_codebase") {
+            values = ["general structure", "authentication", "database", "API", "testing", "configuration"];
+        } else if (ref.name === "find_similar_code") {
+            values = ["error handling", "API routes", "database queries", "authentication", "middleware"];
+        } else if (ref.name === "explain_file") {
+            const col = ensureCollection();
+            const stats = col.stats;
+            if (stats?.docCount > 0) {
+                try {
+                    const response = await col.query({
+                        fieldName: "code_embedding",
+                        vector: await getEmbedding(argument?.value || "", 5000),
+                        topk: 10
+                    });
+                    const results = Array.isArray(response) ? response : response?.rows || [];
+                    values = results.map(r => r.fields?.file_path).filter(Boolean);
+                } catch {}
+            }
+        }
+    } else if (ref.type === "ref/resource") {
+        if (ref.uri === "zvec://file/{path}") {
+            const col = ensureCollection();
+            if (col.stats?.docCount > 0) {
+                try {
+                    const response = await col.query({
+                        fieldName: "code_embedding",
+                        vector: await getEmbedding(argument?.value || "", 5000),
+                        topk: 10
+                    });
+                    const results = Array.isArray(response) ? response : response?.rows || [];
+                    values = results.map(r => r.fields?.file_path).filter(Boolean);
+                } catch {}
+            }
+        }
+    }
+
+    const filtered = argument?.value
+        ? values.filter(v => v.toLowerCase().startsWith(argument.value.toLowerCase()))
+        : values;
+
+    return {
+        completion: { values: filtered.slice(0, 10), hasMore: filtered.length > 10 }
+    };
+});
+
+// ── SetLevel (logging) ──────────────────────────────────────────────────────
+
+server.setRequestHandler(SetLevelRequestSchema, async (request) => {
+    const level = request.params?.level;
+    console.error(`[Zvec Bridge] Log level set to: ${level}`);
+    return {};
+});
+
+// ── Subscribe/Unsubscribe (resource change notifications) ───────────────────
+
+const subscribedResources = new Set();
+
+server.setRequestHandler(SubscribeRequestSchema, async (request) => {
+    const { uri } = request.params;
+    subscribedResources.add(uri);
+    console.error(`[Zvec Bridge] Client subscribed to: ${uri}`);
+    return {};
+});
+
+server.setRequestHandler(UnsubscribeRequestSchema, async (request) => {
+    const { uri } = request.params;
+    subscribedResources.delete(uri);
+    console.error(`[Zvec Bridge] Client unsubscribed from: ${uri}`);
+    return {};
 });
 
 async function main() {
     registerProcessHandlers();
     console.error(`[Zvec Bridge] Start. DB: ${DB_FILE}`);
+    console.error(`[Zvec Bridge] Extensions: ${ALLOWED_EXTENSIONS.join(", ")}`);
+    console.error(`[Zvec Bridge] Model: ${EMBEDDING_MODEL}`);
 
     const transport = new StdioServerTransport();
+    serverTransport = transport;
     await server.connect(transport);
     await ensureKnowledgeReady({ waitForCompletion: false });
     startWatcher();
