@@ -26,6 +26,19 @@ From the repository root:
 npm install
 ```
 
+### Node.js 22+ / onnxruntime-node install failures
+
+`onnxruntime-node` (a transitive dependency of `@huggingface/transformers`) ships
+its core CPU binaries inside the npm tarball but runs a postinstall script that
+attempts to download **optional CUDA provider libraries** from a NuGet feed. On
+machines without CUDA — or behind a firewall — this download times out and,
+under Node.js 22+, the unhandled promise rejection causes the entire `npm install`
+to fail.
+
+The repository includes an `.npmrc` that sets `onnxruntime-node-install=skip`,
+telling the postinstall script to exit immediately. The bundled CPU binaries are
+sufficient for embedding inference; CUDA is not required.
+
 ## Running the bridge
 
 Run the bridge directly:
